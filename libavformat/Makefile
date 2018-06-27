@@ -612,6 +612,7 @@ OBJS-$(CONFIG_TLS_PROTOCOL)              += tls.o $(TLS-OBJS-yes)
 OBJS-$(CONFIG_UDP_PROTOCOL)              += udp.o
 OBJS-$(CONFIG_UDPLITE_PROTOCOL)          += udp.o
 OBJS-$(CONFIG_UNIX_PROTOCOL)             += unix.o
+OBJS-$(CONFIG_MTSP_PROTOCOL)             += mtsp.o fileutil.o
 
 # external library protocols
 OBJS-$(CONFIG_LIBRTMP_PROTOCOL)          += librtmp.o

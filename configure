@@ -315,6 +315,7 @@ External library support:
   --enable-vapoursynth     enable VapourSynth demuxer [no]
   --disable-xlib           disable xlib [autodetect]
   --disable-zlib           disable zlib [autodetect]
+  --enable-libcurl         enable libcurl [yes]
 
   The following libraries provide various hardware acceleration features:
   --disable-amf            disable AMF video encoding code [autodetect]
@@ -1656,6 +1657,7 @@ EXTERNAL_AUTODETECT_LIBRARY_LIST="
     sndio
     xlib
     zlib
+    libcurl
 "
 
 EXTERNAL_LIBRARY_GPL_LIST="
@@ -3328,6 +3330,8 @@ udp_protocol_select="network"
 udplite_protocol_select="network"
 unix_protocol_deps="sys_un_h"
 unix_protocol_select="network"
+mtsp_protocol_deps="libcurl"
+mtsp_protocol_select="network"
 
 # external library protocols
 librtmp_protocol_deps="librtmp"
@@ -6232,7 +6236,7 @@ enabled rkmpp             && { require_pkg_config rkmpp rockchip_mpp  rockchip/r
                                  die "ERROR: rkmpp requires --enable-libdrm"; }
                              }
 enabled vapoursynth       && require_pkg_config vapoursynth "vapoursynth-script >= 42" VSScript.h vsscript_init
-
+enabled libcurl           && require_pkg_config libcurl libcurl curl/curl.h curl_global_init
 
 if enabled gcrypt; then
     GCRYPT_CONFIG="${cross_prefix}libgcrypt-config"
