@@ -170,9 +170,9 @@ int create_directory(const char *path)
     mode_t mode = 0755;
     int err = mkdir(path, mode);
 #endif
-    if (err != 0) {
-        av_log(NULL, AV_LOG_ERROR, "create dir failed. errno: %d\n", err);
-        return AVERROR(err);
+    if (err != 0 && errno != EEXIST) {
+        av_log(NULL, AV_LOG_ERROR, "create dir failed. errno: %d\n", errno);
+        return AVERROR(errno);
     }
     return 0;
 }
@@ -199,10 +199,10 @@ char *current_directory(void)
     char *cwd = getcwd(buf, PATH_MAX);
 #endif
     if (!cwd) {
-        av_log(NULL, AV_LOG_ERROR, "get current directory failed. errno: %d\n", last_error());
+        av_log(NULL, AV_LOG_ERROR, "get current directory failed. errno: %d\n", errno);
         return NULL;
     }
-    return strdup(cwd);
+    return av_strdup(cwd);
 }
 
 size_t file_size(FILE *fp)
