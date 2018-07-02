@@ -98,6 +98,7 @@ typedef struct MTSPContext {
     char *headers;
     uint8_t *post_data;
     int post_data_len;
+    char *ssl_public_key;
 } MTSPContext;
 
 typedef struct CURLWriteData {
@@ -118,13 +119,15 @@ typedef struct ByteRange {
 #define OFFSET(x) offsetof(MTSPContext, x)
 #define D AV_OPT_FLAG_DECODING_PARAM
 #define E AV_OPT_FLAG_ENCODING_PARAM
-#define DEFAULT_USER_AGENT "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.87 Safari/537.36"
-#define RC4_CRYPT_KEY "multi-thread streaming protocol"
+#define DEFAULT_USER_AGENT "Lavf/" AV_STRINGIFY(LIBAVFORMAT_VERSION)
 #define WHITESPACES " \n\t\r"
 #define MAX_RANGES 4096
 #define THROTTLE_THRESHOLD (100 * 1024)
 #define MD5_BLOCK_SIZE (1024 * 1024)
 #define BUFFER_ENOUGH_THRESHOLD (2 * 1024 * 1024)
+
+// rc4 key (md5 for "multi-thread streaming protocol")
+static const char RC4_KEY[] = { 0xbf, 0xa8, 0xf0, 0x70, 0x1e, 0xc7, 0xdc, 0x86, 0x60, 0xad, 0xb4, 0x42, 0x88, 0x77, 0x94, 0xcf };
 
 static const AVOption options[] = {
     { "file_dir", "output directory path", OFFSET(file_dir), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
@@ -135,13 +138,14 @@ static const AVOption options[] = {
     { "max_conn", "max simultaneous connections to server", OFFSET(max_conn), AV_OPT_TYPE_INT, { .i64 = 64 }, 0, 1024, D },
     { "bitrate", "bit rate of stream", OFFSET(bitrate), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, D },
     { "throttled_speed", "speed limit by server", OFFSET(throttled_speed), AV_OPT_TYPE_INT, { .i64 = 0 }, -1, INT_MAX, D },
-    { "min_range_len", "minimum download range length in bytes", OFFSET(min_range_len), AV_OPT_TYPE_INT, { .i64 = 100 * 1024 }, 0, INT_MAX, D },
-    { "max_range_len", "maximum download range length in bytes", OFFSET(max_range_len), AV_OPT_TYPE_INT, { .i64 = 2 * 1024 * 1024 }, 0, INT_MAX, D },
-    { "user_agent", "override User-Agent header", OFFSET(user_agent), AV_OPT_TYPE_STRING, { .str = DEFAULT_USER_AGENT }, 0, 0, D },
-    { "referer", "override referer header", OFFSET(referer), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
-    { "cookies", "set cookies to be sent in future requests, ';' delimited", OFFSET(cookies), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
-    { "headers", "set custom HTTP headers, can override default headers", OFFSET(headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
-    { "post_data", "set custom HTTP post data", OFFSET(post_data), AV_OPT_TYPE_BINARY, .flags = D },
+    { "min_range_len", "minimum download range in bytes", OFFSET(min_range_len), AV_OPT_TYPE_INT, { .i64 = 100 * 1024 }, 0, INT_MAX, D },
+    { "max_range_len", "maximum download range in bytes", OFFSET(max_range_len), AV_OPT_TYPE_INT, { .i64 = 2 * 1024 * 1024 }, 0, INT_MAX, D },
+    { "user_agent", "User-Agent header", OFFSET(user_agent), AV_OPT_TYPE_STRING, { .str = DEFAULT_USER_AGENT }, 0, 0, D },
+    { "referer", "Referer header", OFFSET(referer), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+    { "cookies", "cookies to be sent in future requests, ';' delimited", OFFSET(cookies), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+    { "headers", "custom HTTP headers, can override default headers", OFFSET(headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+    { "post_data", "custom HTTP post data", OFFSET(post_data), AV_OPT_TYPE_BINARY, .flags = D },
+    { "ssl_public_key", "ssl public key for verification", OFFSET(ssl_public_key), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { NULL }
 };
 
@@ -1065,6 +1069,8 @@ static int set_curl_opt(MTSPContext *s, CURL *curl_handle)
         curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, (long)s->post_data_len);
         curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, s->post_data);
     }
+    if (s->ssl_public_key)
+        curl_easy_setopt(curl_handle, CURLOPT_PINNEDPUBLICKEY, s->ssl_public_key);
     return 0;
 }
 
@@ -1160,7 +1166,13 @@ static size_t header_func(void *header, size_t size, size_t nmemb, void *userp)
             if ((name = av_strtok(param, "=", &value))) {
                 if (!av_strcasecmp(name, "filename")) {
                     av_free(s->file_name);
-                    s->file_name = ff_urldecode(value);
+                    char *name = ff_urldecode(value);
+                    size_t len = strlen(name);
+                    if (len > 2 && name[0] == '"' && name[len - 1] == '"') {
+                        s->file_name = av_strndup(name + 1, len - 2);
+                        av_free(name);
+                    } else
+                        s->file_name = name;
                     av_log(s, AV_LOG_DEBUG, "file name: %s\n", s->file_name);
                     break;
                 }
@@ -1205,9 +1217,10 @@ static int get_file_info(MTSPContext *s)
     // CURLcode ret = curl_easy_getinfo(curl_handle, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &filesize);
     curl_easy_cleanup(curl_handle);
 
-    if (!s->file_size)
+    if (!s->file_size) {
+        av_log(s, AV_LOG_ERROR, "get file size failed\n");
         return -1;
-
+    }
     return 0;
 }
 
@@ -1314,6 +1327,34 @@ static int check_md5(MTSPContext *s)
     return 0;
 }
 
+static void merge_chunk_pool(MTSPContext *s)
+{
+    int written = 0;
+    Chunk *chunk = s->chunk_pool;
+    while (chunk) {
+        while (merge_next_chunk(s, chunk) == 0);
+        if (chunk != s->current_read_chunk && chunk->end_pos == chunk->size && chunk->buffer) {
+            int prev_written = (chunk->prev && !chunk->prev->buffer &&
+                                chunk->prev->start + chunk->prev->size == chunk->start) ||
+                               (!chunk->prev && !chunk->start);
+            int next_written = (chunk->next && !chunk->next->buffer &&
+                                chunk->start + chunk->size == chunk->next->start) ||
+                               (!chunk->next && chunk->start + chunk->size == s->file_size);
+            if (chunk->size >= s->disk_cache || (prev_written && next_written))
+                if (write_chunk_to_disk(s, chunk, 1) == 0)
+                    written = 1;
+        }
+        chunk = chunk->next;
+    }
+    if (written) {
+        while (chunk) {
+            while (merge_next_chunk(s, chunk) == 0);
+            chunk = chunk->next;
+        }
+        save_progress_to_file(s);
+    }
+}
+
 static void *download_task(void *arg)
 {
     MTSPContext *s = arg;
@@ -1326,6 +1367,7 @@ static void *download_task(void *arg)
     struct timeval timeout;
     int64_t start, end;
     int64_t last_update_speed = 0;
+    int64_t last_scan_chunk = 0;
 
     curl_global_init(CURL_GLOBAL_ALL);
 
@@ -1341,8 +1383,8 @@ static void *download_task(void *arg)
         ret = open_local_file(s, &exists);
         pthread_mutex_unlock(&s->mutex);
         if (ret < 0)
-            goto fail;
-        if (exists) {
+            s->dont_write_disk = 1;
+        else if (exists) {
             pthread_mutex_lock(&s->mutex);
             load_progress_from_file(s);
             pthread_mutex_unlock(&s->mutex);
@@ -1412,7 +1454,7 @@ next:
             if (msg->msg == CURLMSG_DONE)
                 av_log(s, AV_LOG_INFO, "R: %s %d - %s\n", worker_str, msg->data.result,
                        curl_easy_strerror(msg->data.result));
-            else if (msg->data.result != CURLE_WRITE_ERROR)
+            else
                 av_log(s, AV_LOG_ERROR, "E: %s CURLMsg (%d)\n", worker_str, msg->msg);
             av_free(worker_str);
 
@@ -1425,6 +1467,16 @@ next:
         }
 
         int64_t now = av_gettime_relative();
+
+        if (!last_scan_chunk)
+            last_scan_chunk = now;
+        else if (now >= last_scan_chunk + 5000000) {
+            pthread_mutex_lock(&s->mutex);
+            merge_chunk_pool(s);
+            pthread_mutex_unlock(&s->mutex);
+            last_scan_chunk = now;
+        }
+
         pthread_mutex_lock(&s->mutex);
         Worker *worker = s->worker_pool;
         while (worker) {
@@ -1502,7 +1554,7 @@ static int parse_url(MTSPContext *s)
         struct AVRC4 *rc4 = av_rc4_alloc();
         if (!rc4)
             return AVERROR(ENOMEM);
-        av_rc4_init(rc4, RC4_CRYPT_KEY, 256, 1);
+        av_rc4_init(rc4, RC4_KEY, 128, 1);
         av_rc4_crypt(rc4, real_url, real_url, ret, NULL, 1);
         av_free(rc4);
 
@@ -1519,6 +1571,7 @@ static int parse_url(MTSPContext *s)
 static int mtsp_open(URLContext *h, const char *uri, int flags,
                      AVDictionary **options)
 {
+    av_log_set_level(AV_LOG_DEBUG);
     av_log(h, AV_LOG_INFO, "mtsp_open, uri: %s\n", uri);
     MTSPContext *s = h->priv_data;
 
