@@ -11,5 +11,6 @@ int create_directory(const char *path);
 int is_writable(const char *path);
 char *current_directory(void);
 size_t file_size(FILE *fp);
+char *conv_file_name(char *utf8_name);
 
 #endif

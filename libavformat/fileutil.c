@@ -95,22 +95,16 @@ int allocate_file(FILE *fp, int64_t offset, int64_t length, int sparse)
     }
 #elif defined(__APPLE__) && defined(__MACH__)
     int64_t toalloc = offset + length - file_size(fp);
-    while (toalloc > 0) {
-        fstore_t fstore = {
-                F_ALLOCATECONTIG | F_ALLOCATEALL, F_PEOFPOSMODE, 0,
-                // Allocate in 1GB chunks or else some OSX versions may choke.
-                FFMIN(toalloc, (int64_t)1 << 30), 0};
+    fstore_t fstore = { F_ALLOCATECONTIG | F_ALLOCATEALL, F_PEOFPOSMODE, 0, toalloc, 0 };
+    if (fcntl(fd, F_PREALLOCATE, &fstore) == -1) {
+        // Retry non-contig.
+        fstore.fst_flags = F_ALLOCATEALL;
         if (fcntl(fd, F_PREALLOCATE, &fstore) == -1) {
-            // Retry non-contig.
-            fstore.fst_flags = F_ALLOCATEALL;
-            if (fcntl(fd, F_PREALLOCATE, &fstore) == -1) {
-                int err = last_error();
-                av_log(NULL, AV_LOG_ERROR, "fcntl(F_PREALLOCATE) of %" PRId64 " failed. errno: %d\n",
-                                         fstore.fst_length, err);
-                return AVERROR(err);
-            }
+            int err = last_error();
+            av_log(NULL, AV_LOG_ERROR, "fcntl(F_PREALLOCATE) of %" PRId64 " failed. errno: %d\n",
+                                     fstore.fst_length, err);
+            return AVERROR(err);
         }
-        toalloc -= fstore.fst_bytesalloc;
     }
     // This forces the allocation on disk.
     ftruncate(fd, offset + length);
@@ -212,4 +206,22 @@ size_t file_size(FILE *fp)
     size_t size = ftell(fp);
     fseek(fp, prev, SEEK_SET);
     return size;
+}
+
+char *conv_file_name(char *utf8_name)
+{
+#if defined(_WIN32)
+    int len = ::MultiByteToWideChar(CP_UTF8, 0, utf8_name, -1, NULL, 0);
+    wchar_t *unicode = av_mallocz((len + 1) * sizeof(wchar_t));
+    ::MultiByteToWideChar(CP_UTF8, 0, utf8_name, -1, unicode, len);
+
+    len = ::WideCharToMultiByte(CP_ACP, 0, unicode, -1, NULL, 0, NULL, NULL);
+    char *ansi_name = av_mallocz((len + 1) * sizeof(char));
+    ::WideCharToMultiByte(CP_ACP, 0, unicode, -1, ansi_name, len, NULL, NULL);  
+  
+    av_free(unicode);
+    return ansi_name;
+#else
+    return av_strdup(utf8_name);
+#endif
 }

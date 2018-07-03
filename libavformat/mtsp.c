@@ -132,7 +132,7 @@ static const char RC4_KEY[] = { 0xbf, 0xa8, 0xf0, 0x70, 0x1e, 0xc7, 0xdc, 0x86, 
 static const AVOption options[] = {
     { "file_dir", "output directory path", OFFSET(file_dir), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "reconnect_interval", "reconnect interval in seconds", OFFSET(reconnect_interval), AV_OPT_TYPE_INT, { .i64 = 3 }, 0, 60, D },
-    { "update_speed_interval", "calculate speed interval in seconds", OFFSET(update_speed_interval), AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 60, D },
+    { "update_speed_interval", "calculate speed interval in seconds", OFFSET(update_speed_interval), AV_OPT_TYPE_INT, { .i64 = 2 }, 0, 60, D },
     { "dont_write_disk", "buffering data in memory only", OFFSET(dont_write_disk), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
     { "disk_cache", "disk cache size in bytes", OFFSET(disk_cache), AV_OPT_TYPE_INT, { .i64 = 4 * 1024 * 1024 }, 0, 64 * 1024 * 1024, D },
     { "max_conn", "max simultaneous connections to server", OFFSET(max_conn), AV_OPT_TYPE_INT, { .i64 = 64 }, 0, 1024, D },
@@ -774,8 +774,8 @@ static void on_worker_done(MTSPContext *s, Worker *worker)
                 s->min_range_len = FFMIN(s->worker_avg_speed * 10, 500 * 1024);
             }
     }
-    av_log(s, AV_LOG_DEBUG, "on_worker_done <%"PRId64"-%"PRId64">, finished workers: %d, avg speed: %.1fkB/s\n",
-        worker->start, worker->end, s->finished_workers, s->worker_avg_speed / 1024.0);
+    av_log(s, AV_LOG_DEBUG, "on_worker_done <%"PRId64"-%"PRId64">, speed: %.1fkB/s, finished workers: %d, avg speed: %.1fkB/s\n",
+        worker->start, worker->end, speed / 1024.0, s->finished_workers, s->worker_avg_speed / 1024.0);
     destroy_worker(s, worker);
 }
 
@@ -1165,14 +1165,13 @@ static size_t header_func(void *header, size_t size, size_t nmemb, void *userp)
             param += strspn(param, WHITESPACES);
             if ((name = av_strtok(param, "=", &value))) {
                 if (!av_strcasecmp(name, "filename")) {
+                    size_t len = strlen(value);
+                    if (len > 2 && value[0] == '"' && value[len-1] == '"')
+                        value++[len-1] = '\0';
+                    char *utf8_name = ff_urldecode(value);
                     av_free(s->file_name);
-                    char *name = ff_urldecode(value);
-                    size_t len = strlen(name);
-                    if (len > 2 && name[0] == '"' && name[len - 1] == '"') {
-                        s->file_name = av_strndup(name + 1, len - 2);
-                        av_free(name);
-                    } else
-                        s->file_name = name;
+                    s->file_name = conv_file_name(utf8_name);
+                    av_free(utf8_name);
                     av_log(s, AV_LOG_DEBUG, "file name: %s\n", s->file_name);
                     break;
                 }
@@ -1367,7 +1366,7 @@ static void *download_task(void *arg)
     struct timeval timeout;
     int64_t start, end;
     int64_t last_update_speed = 0;
-    int64_t last_scan_chunk = 0;
+    int64_t last_merge_chunk = 0;
 
     curl_global_init(CURL_GLOBAL_ALL);
 
@@ -1468,13 +1467,13 @@ next:
 
         int64_t now = av_gettime_relative();
 
-        if (!last_scan_chunk)
-            last_scan_chunk = now;
-        else if (now >= last_scan_chunk + 5000000) {
+        if (!last_merge_chunk)
+            last_merge_chunk = now;
+        else if (now >= last_merge_chunk + 5000000) {
             pthread_mutex_lock(&s->mutex);
             merge_chunk_pool(s);
             pthread_mutex_unlock(&s->mutex);
-            last_scan_chunk = now;
+            last_merge_chunk = now;
         }
 
         pthread_mutex_lock(&s->mutex);
