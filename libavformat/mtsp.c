@@ -58,8 +58,11 @@ typedef Worker *WorkerPool; // double linked list (worker_pool point to tail nod
 typedef struct MTSPContext {
     const AVClass *class;
     pthread_t download_thread;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
+    pthread_mutex_t mutex_init;
+    pthread_cond_t cond_init_done;
+    pthread_mutex_t mutex_data;
+    pthread_cond_t cond_data_avail;
+    int init_done;
     int abort_download;
     int exit_code;
     Chunk *current_read_chunk;
@@ -894,7 +897,7 @@ static void check_buffer_len(MTSPContext *s)
     }
 
     av_log(s, AV_LOG_DEBUG, "check_buffer_len, buffered data: %"PRId64"\n", buffered_data);
-    pthread_cond_signal(&s->cond);
+    pthread_cond_signal(&s->cond_data_avail);
 
     if (chunk->start + chunk->end_pos == s->file_size) {
         s->buffer_not_enough = 0;
@@ -1038,9 +1041,9 @@ static size_t write_func(void *contents, size_t size, size_t nmemb, void *userp)
         return l;
     }
 
-    pthread_mutex_lock(&s->mutex);
+    pthread_mutex_lock(&s->mutex_data);
     int ret = put_data_to_pool(s, data->worker, contents, l);
-    pthread_mutex_unlock(&s->mutex);
+    pthread_mutex_unlock(&s->mutex_data);
     return ret;
 }
 
@@ -1378,31 +1381,32 @@ static void *download_task(void *arg)
 
     if (!s->dont_write_disk) {
         int exists = 0;
-        pthread_mutex_lock(&s->mutex);
         ret = open_local_file(s, &exists);
-        pthread_mutex_unlock(&s->mutex);
         if (ret < 0)
             s->dont_write_disk = 1;
-        else if (exists) {
-            pthread_mutex_lock(&s->mutex);
+        else if (exists)
             load_progress_from_file(s);
-            pthread_mutex_unlock(&s->mutex);
-        }
     }
 
     s->curl_multi_handle = curl_multi_init();
     // curl_multi_setopt(s->curl_multi_handle, CURLMOPT_MAXCONNECTS, (long)s->max_conn);
 
+    pthread_mutex_lock(&s->mutex_init);
+    s->exit_code = 0;
+    s->init_done = 1;
+    pthread_cond_signal(&s->cond_init_done);
+    pthread_mutex_unlock(&s->mutex_init);
+
     while (!s->abort_download) {
         while (1) {
-            pthread_mutex_lock(&s->mutex);
+            pthread_mutex_lock(&s->mutex_data);
             int ret = pick_next_range(s, &start, &end);
-            pthread_mutex_unlock(&s->mutex);
+            pthread_mutex_unlock(&s->mutex_data);
             if (ret)
                 break;
-            pthread_mutex_lock(&s->mutex);
+            pthread_mutex_lock(&s->mutex_data);
             create_worker(s, start, end);
-            pthread_mutex_unlock(&s->mutex);
+            pthread_mutex_unlock(&s->mutex_data);
         }
         // if (!s->running_workers)
         //     break;
@@ -1457,12 +1461,12 @@ next:
                 av_log(s, AV_LOG_ERROR, "E: %s CURLMsg (%d)\n", worker_str, msg->msg);
             av_free(worker_str);
 
-            pthread_mutex_lock(&s->mutex);
+            pthread_mutex_lock(&s->mutex_data);
             if (!data->worker->current_chunk)
                 on_worker_done(s, data->worker);
             else
                 on_worker_fail(s, data->worker);
-            pthread_mutex_unlock(&s->mutex);
+            pthread_mutex_unlock(&s->mutex_data);
         }
 
         int64_t now = av_gettime_relative();
@@ -1470,46 +1474,46 @@ next:
         if (!last_merge_chunk)
             last_merge_chunk = now;
         else if (now >= last_merge_chunk + 5000000) {
-            pthread_mutex_lock(&s->mutex);
+            pthread_mutex_lock(&s->mutex_data);
             merge_chunk_pool(s);
-            pthread_mutex_unlock(&s->mutex);
+            pthread_mutex_unlock(&s->mutex_data);
             last_merge_chunk = now;
         }
 
-        pthread_mutex_lock(&s->mutex);
+        pthread_mutex_lock(&s->mutex_data);
         Worker *worker = s->worker_pool;
         while (worker) {
             if (worker->next_reconnect && now >= worker->next_reconnect)
                 worker_reconnect(s, worker);
             worker = worker->prev;
         }
-        pthread_mutex_unlock(&s->mutex);
+        pthread_mutex_unlock(&s->mutex_data);
 
         int64_t interval = s->update_speed_interval * 1000000;
         if (!last_update_speed)
             last_update_speed = now;
         else if (now >= last_update_speed + interval) {
-            pthread_mutex_lock(&s->mutex);
+            pthread_mutex_lock(&s->mutex_data);
             calc_speed(s, (now - last_update_speed) / 1000000.0, 1);
-            pthread_mutex_unlock(&s->mutex);
+            pthread_mutex_unlock(&s->mutex_data);
             last_update_speed = now;
         }
 
-        pthread_mutex_lock(&s->mutex);
+        pthread_mutex_lock(&s->mutex_data);
         if (s->read_pos && !s->current_read_chunk && !s->seek_end_for_meta)
             destroy_worker_pool(s);
         check_buffer_len(s);
-        pthread_mutex_unlock(&s->mutex);
+        pthread_mutex_unlock(&s->mutex_data);
     }
 
 fail:
-    pthread_mutex_lock(&s->mutex);
+    pthread_mutex_lock(&s->mutex_data);
     destroy_worker_pool(s);
     flush_chunk_pool(s);
     check_md5(s);
     destroy_chunk_pool(s);
     close_local_file(s);
-    pthread_mutex_unlock(&s->mutex);
+    pthread_mutex_unlock(&s->mutex_data);
 
     curl_multi_cleanup(s->curl_multi_handle);
     s->curl_multi_handle = NULL;
@@ -1520,7 +1524,13 @@ fail:
     av_freep(&s->mime_type);
     av_freep(&s->progress_file_name);
 
+    pthread_mutex_lock(&s->mutex_init);
     s->exit_code = ret;
+    if (!s->init_done) {
+        s->init_done = 1;
+        pthread_cond_signal(&s->cond_init_done);
+    }
+    pthread_mutex_unlock(&s->mutex_init);
     return &s->exit_code;
 }
 
@@ -1582,29 +1592,56 @@ static int mtsp_open(URLContext *h, const char *uri, int flags,
     if (ret < 0)
         goto fail;
 
-    ret = pthread_mutex_init(&s->mutex, NULL);
+    ret = pthread_mutex_init(&s->mutex_init, NULL);
     if (ret) {
         av_log(h, AV_LOG_FATAL, "pthread_mutex_init failed, error: %s\n", av_err2str(ret));
         goto fail;
     }
-
-    ret = pthread_cond_init(&s->cond, NULL);
+    ret = pthread_cond_init(&s->cond_init_done, NULL);
     if (ret) {
         av_log(h, AV_LOG_FATAL, "pthread_cond_init failed, error: %s\n", av_err2str(ret));
-        goto cond_fail;
+        goto cond_init_done_fail;
     }
-
+    ret = pthread_mutex_init(&s->mutex_data, NULL);
+    if (ret) {
+        av_log(h, AV_LOG_FATAL, "pthread_mutex_init failed, error: %s\n", av_err2str(ret));
+        goto mutex_data_fail;
+    }
+    ret = pthread_cond_init(&s->cond_data_avail, NULL);
+    if (ret) {
+        av_log(h, AV_LOG_FATAL, "pthread_cond_init failed, error: %s\n", av_err2str(ret));
+        goto cond_data_avail_fail;
+    }
     ret = pthread_create(&s->download_thread, NULL, download_task, s);
     if (ret) {
         av_log(h, AV_LOG_FATAL, "pthread_create failed, error: %s\n", av_err2str(ret));
         goto thread_fail;
     }
+
+    pthread_mutex_lock(&s->mutex_init);
+    while (!s->init_done)
+        pthread_cond_wait(&s->cond_init_done, &s->mutex_init);
+    ret = s->exit_code;
+    pthread_mutex_unlock(&s->mutex_init);
+
+    if (ret) {
+        int err = pthread_join(s->download_thread, NULL);
+        if (err)
+            av_log(h, AV_LOG_ERROR, "pthread_join failed, error: %s\n", av_err2str(err));
+        goto thread_fail;
+    }
+
+    av_log(h, AV_LOG_DEBUG, "open url success\n");
     return 0;
 
 thread_fail:
-    pthread_cond_destroy(&s->cond);
-cond_fail:
-    pthread_mutex_destroy(&s->mutex);
+    pthread_cond_destroy(&s->cond_data_avail);
+cond_data_avail_fail:
+    pthread_mutex_destroy(&s->mutex_data);
+mutex_data_fail:
+    pthread_cond_destroy(&s->cond_init_done);
+cond_init_done_fail:
+    pthread_mutex_destroy(&s->mutex_init);
 fail:
     av_freep(&s->url);
     return ret;
@@ -1620,8 +1657,10 @@ static int mtsp_close(URLContext *h)
     if (ret)
         av_log(h, AV_LOG_ERROR, "pthread_join failed, error: %s\n", av_err2str(ret));
 
-    pthread_cond_destroy(&s->cond);
-    pthread_mutex_destroy(&s->mutex);
+    pthread_cond_destroy(&s->cond_data_avail);
+    pthread_mutex_destroy(&s->mutex_data);
+    pthread_cond_destroy(&s->cond_init_done);
+    pthread_mutex_destroy(&s->mutex_init);
     av_freep(&s->url);
     return ret ? ret : s->exit_code;
 }
@@ -1635,7 +1674,7 @@ static int wait_data_timeout(MTSPContext *s, int64_t timeout, AVIOInterruptCB *i
         int64_t t = av_gettime() + POLLING_TIME * 1000;
         struct timespec ts = { .tv_sec  =  t / 1000000,
                                .tv_nsec = (t % 1000000) * 1000 };
-        int ret = pthread_cond_timedwait(&s->cond, &s->mutex, &ts);
+        int ret = pthread_cond_timedwait(&s->cond_data_avail, &s->mutex_data, &ts);
         if (ret != ETIMEDOUT)
             return ret;
         if (timeout > 0) {
@@ -1651,12 +1690,12 @@ static int mtsp_read(URLContext *h, uint8_t *buf, int size)
 {
     MTSPContext *s = h->priv_data;
 
-    pthread_mutex_lock(&s->mutex);
+    pthread_mutex_lock(&s->mutex_data);
     int ret = get_data_from_pool(s, buf, size);
     if (!ret && !(h->flags & AVIO_FLAG_NONBLOCK))
         if (!wait_data_timeout(s, h->rw_timeout, &h->interrupt_callback))
             ret = get_data_from_pool(s, buf, size);
-    pthread_mutex_unlock(&s->mutex);
+    pthread_mutex_unlock(&s->mutex_data);
     return ret;
 }
 
@@ -1682,9 +1721,9 @@ static int64_t mtsp_seek(URLContext *h, int64_t off, int whence)
     if (off < 0)
         return AVERROR(EINVAL);
 
-    pthread_mutex_lock(&s->mutex);
+    pthread_mutex_lock(&s->mutex_data);
     set_read_pos(s, off);
-    pthread_mutex_unlock(&s->mutex);
+    pthread_mutex_unlock(&s->mutex_data);
 
     return off;
 }
