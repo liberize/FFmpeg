@@ -130,7 +130,7 @@ typedef struct ByteRange {
 #define BUFFER_ENOUGH_THRESHOLD (2 * 1024 * 1024)
 
 // rc4 key (md5 for "multi-thread streaming protocol")
-static const char RC4_KEY[] = { 0xbf, 0xa8, 0xf0, 0x70, 0x1e, 0xc7, 0xdc, 0x86, 0x60, 0xad, 0xb4, 0x42, 0x88, 0x77, 0x94, 0xcf };
+const char MTSP_RC4_KEY[16] = { 0xbf, 0xa8, 0xf0, 0x70, 0x1e, 0xc7, 0xdc, 0x86, 0x60, 0xad, 0xb4, 0x42, 0x88, 0x77, 0x94, 0xcf };
 
 static const AVOption options[] = {
     { "file_dir", "output directory path", OFFSET(file_dir), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
@@ -1063,7 +1063,7 @@ static int set_curl_opt(MTSPContext *s, CURL *curl_handle)
         if (!next)
             return AVERROR(ENOMEM);
         struct curl_slist *chunk = NULL;
-        while (header = av_strtok(next, "\n", &next))
+        while (header = av_strtok(next, "\r\n", &next))
             chunk = curl_slist_append(chunk, header);
         curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, chunk);
         av_free(headers);
@@ -1563,7 +1563,7 @@ static int parse_url(MTSPContext *s)
         struct AVRC4 *rc4 = av_rc4_alloc();
         if (!rc4)
             return AVERROR(ENOMEM);
-        av_rc4_init(rc4, RC4_KEY, 128, 1);
+        av_rc4_init(rc4, MTSP_RC4_KEY, 128, 1);
         av_rc4_crypt(rc4, real_url, real_url, ret, NULL, 1);
         av_free(rc4);
 
@@ -1580,7 +1580,12 @@ static int parse_url(MTSPContext *s)
 static int mtsp_open(URLContext *h, const char *uri, int flags,
                      AVDictionary **options)
 {
+    // for debug
     av_log_set_level(AV_LOG_DEBUG);
+    av_opt_set(h->priv_data, "user_agent", pcs_get_user_agent(PCS_WIN_UA), 0);
+    av_opt_set(h->priv_data, "referer", pcs_get_referer(), 0);
+    av_opt_set(h->priv_data, "ssl_public_key", pcs_get_ssl_public_key(), 0);
+
     av_log(h, AV_LOG_INFO, "mtsp_open, uri: %s\n", uri);
     MTSPContext *s = h->priv_data;
 
