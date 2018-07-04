@@ -17,6 +17,7 @@
 #include "url.h"
 #include "fileutil.h"
 #include "urldecode.h"
+#include "baidupcs.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -92,6 +93,7 @@ typedef struct MTSPContext {
     int max_conn;
     int bitrate;            // 0: unknown, other: bitrate
     int throttled_speed;    // 0: unknown, -1: no throttle, other: throttled speed
+    int detect_throttle;
     int min_range_len;
     int max_range_len;
     int last_range_len;
@@ -102,6 +104,7 @@ typedef struct MTSPContext {
     uint8_t *post_data;
     int post_data_len;
     char *ssl_public_key;
+    char *preset;
 } MTSPContext;
 
 typedef struct CURLWriteData {
@@ -141,14 +144,16 @@ static const AVOption options[] = {
     { "max_conn", "max simultaneous connections to server", OFFSET(max_conn), AV_OPT_TYPE_INT, { .i64 = 64 }, 0, 1024, D },
     { "bitrate", "bit rate of stream", OFFSET(bitrate), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, D },
     { "throttled_speed", "speed limit by server", OFFSET(throttled_speed), AV_OPT_TYPE_INT, { .i64 = 0 }, -1, INT_MAX, D },
-    { "min_range_len", "minimum download range in bytes", OFFSET(min_range_len), AV_OPT_TYPE_INT, { .i64 = 100 * 1024 }, 0, INT_MAX, D },
-    { "max_range_len", "maximum download range in bytes", OFFSET(max_range_len), AV_OPT_TYPE_INT, { .i64 = 2 * 1024 * 1024 }, 0, INT_MAX, D },
-    { "user_agent", "User-Agent header", OFFSET(user_agent), AV_OPT_TYPE_STRING, { .str = DEFAULT_USER_AGENT }, 0, 0, D },
+    { "detect_throttle", "detect speed throttle", OFFSET(detect_throttle), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
+    { "min_range_len", "min download range in bytes", OFFSET(min_range_len), AV_OPT_TYPE_INT, { .i64 = 100 * 1024 }, 0, INT_MAX, D },
+    { "max_range_len", "max download range in bytes", OFFSET(max_range_len), AV_OPT_TYPE_INT, { .i64 = 2 * 1024 * 1024 }, 0, INT_MAX, D },
+    { "user_agent", "User-Agent header", OFFSET(user_agent), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "referer", "Referer header", OFFSET(referer), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "cookies", "cookies to be sent in future requests, ';' delimited", OFFSET(cookies), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "headers", "custom HTTP headers, can override default headers", OFFSET(headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "post_data", "custom HTTP post data", OFFSET(post_data), AV_OPT_TYPE_BINARY, .flags = D },
     { "ssl_public_key", "ssl public key for verification", OFFSET(ssl_public_key), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+    { "preset", "preset configurations", OFFSET(preset), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { NULL }
 };
 
@@ -594,7 +599,7 @@ static void reset_worker_end(MTSPContext *s, Worker *worker, int64_t end)
 
 static int pick_next_range(MTSPContext *s, int64_t *start, int64_t *end)
 {
-    int max_conn = s->throttled_speed ? s->max_conn : 3;
+    int max_conn = (!s->detect_throttle || s->throttled_speed) ? s->max_conn : 3;
     if (s->buffer_not_enough && s->throttled_speed > 0)
         max_conn += FFMIN(max_conn / 4, 10);
     if (s->seek_end_for_meta)
@@ -615,11 +620,13 @@ static int pick_next_range(MTSPContext *s, int64_t *start, int64_t *end)
             end_pos = chunk->next->start;
         if (s->buffer_not_enough)
             *start = FFMIN(*start, chunk->start + chunk->end_pos + s->min_range_len);
+        if (s->dont_write_disk && *start > s->read_pos + BUFFER_ENOUGH_THRESHOLD * 10)
+            return -2;
         reset_worker_end(s, chunk->worker, *start);
         if (*start == s->file_size) {
             s->buffer_not_enough = 0;
             if (s->dont_write_disk)
-                return -1;
+                return -3;
             fill_hole = 1;
         }
     } else if (s->chunk_pool) {
@@ -650,7 +657,7 @@ static int pick_next_range(MTSPContext *s, int64_t *start, int64_t *end)
             if (max_unfinished < s->min_range_len) {
                 find_max_unfinished(s->chunk_pool, s->current_read_chunk, &max_unfinished, &max_chunk);
                 if (max_unfinished < s->min_range_len)
-                    return -1;
+                    return -4;
             }
             *start = max_chunk->start + max_chunk->end_pos + max_unfinished / 2;
             end_pos = max_chunk->start + max_chunk->size;
@@ -671,7 +678,7 @@ static int pick_next_range(MTSPContext *s, int64_t *start, int64_t *end)
             len = FFMIN(FFMAX(len, s->min_range_len), s->max_range_len);
         } else if (s->buffer_not_enough) {
             len = s->min_range_len;
-        } else if (s->bitrate) {
+        } else if (s->bitrate && s->throttled_speed > 0) {
             len = s->throttled_speed * (*start - s->read_pos) / (s->bitrate / 8 - s->throttled_speed);
             len = len * 3 / 4;
             len = FFMIN(FFMAX(len, s->min_range_len), s->max_range_len);
@@ -761,12 +768,12 @@ static void on_worker_done(MTSPContext *s, Worker *worker)
         av_log(s, AV_LOG_WARNING, "failed to get average speed\n");
     else if (size >= s->min_range_len) {
         s->worker_avg_speed = (s->worker_avg_speed * (s->finished_workers - 1) + speed) / s->finished_workers;
-        if (!s->throttled_speed && speed >= THROTTLE_THRESHOLD) {
+        if (s->detect_throttle && !s->throttled_speed && speed >= THROTTLE_THRESHOLD) {
             s->throttled_speed = -1;
             s->max_conn = 1;    // fallback to single connection
             s->min_range_len = 500 * 1024;
         }
-        if (s->throttled_speed != -1 && s->finished_workers >= 3)
+        if (s->detect_throttle && s->throttled_speed != -1 && s->finished_workers >= 3)
             if (s->worker_avg_speed < 15 * 1024) {
                 s->throttled_speed = 10 * 1024;
                 s->max_conn = 64;
@@ -1248,7 +1255,7 @@ static void calc_speed(MTSPContext *s, double interval, int print)
                         worker->start, worker->end, temp_speed / 1024.0, avg_speed / 1024.0, time_spent,
                         worker->current_chunk ? worker->current_chunk->start + worker->current_chunk->end_pos : worker->end);
             worker->downloaded_size = size;
-            if (time_spent >= 5.0 && !s->throttled_speed)
+            if (time_spent >= 5.0 && s->detect_throttle && !s->throttled_speed)
                 if (avg_speed >= THROTTLE_THRESHOLD) {
                     s->throttled_speed = -1;
                     s->max_conn = 1;
@@ -1261,7 +1268,7 @@ static void calc_speed(MTSPContext *s, double interval, int print)
             active_worker++;
         worker = worker->prev;
     }
-    if (!s->throttled_speed && low_speed_worker == total_worker && total_worker >= 3) {
+    if (s->detect_throttle && !s->throttled_speed && low_speed_worker == total_worker && total_worker >= 3) {
         s->throttled_speed = 10 * 1024;
         s->max_conn = 64;
         s->min_range_len = 100 * 1024;
@@ -1577,17 +1584,38 @@ static int parse_url(MTSPContext *s)
     return 0;
 }
 
+static void load_preset(MTSPContext *s)
+{
+    if (!s->preset || !strcmp(s->preset, "default")) {
+        if (!s->user_agent)
+            s->user_agent = av_strdup(DEFAULT_USER_AGENT);
+    } else if (!strcmp(s->preset, "pcs")) {
+        if (!s->user_agent)
+            s->user_agent = pcs_get_user_agent(PCS_WIN_UA);
+        if (!s->referer)
+            s->referer = pcs_get_referer();
+        char *ssl_public_key = pcs_get_ssl_public_key();
+        if (!s->ssl_public_key)
+            s->ssl_public_key = ssl_public_key;
+        else {
+            int len = strlen(s->ssl_public_key) + 1 + strlen(ssl_public_key) + 1;
+            if (av_reallocp(&s->ssl_public_key, len) == 0)
+                av_strlcatf(s->ssl_public_key, len, ";%s", ssl_public_key);
+            av_free(ssl_public_key);
+        }
+        s->detect_throttle = 1;
+    }
+}
+
 static int mtsp_open(URLContext *h, const char *uri, int flags,
                      AVDictionary **options)
 {
     // for debug
     av_log_set_level(AV_LOG_DEBUG);
-    av_opt_set(h->priv_data, "user_agent", pcs_get_user_agent(PCS_WIN_UA), 0);
-    av_opt_set(h->priv_data, "referer", pcs_get_referer(), 0);
-    av_opt_set(h->priv_data, "ssl_public_key", pcs_get_ssl_public_key(), 0);
 
     av_log(h, AV_LOG_INFO, "mtsp_open, uri: %s\n", uri);
     MTSPContext *s = h->priv_data;
+    load_preset(s);
 
     s->url = av_strdup(uri);
     if (!s->url)

@@ -6,8 +6,8 @@ enum PCSUserAgentType {
     PCS_WIN_UA
 };
 
-const char *pcs_get_user_agent(enum PCSUserAgentType type);
-const char *pcs_get_referer(void);
-const char *pcs_get_ssl_public_key(void);
+char *pcs_get_user_agent(enum PCSUserAgentType type);
+char *pcs_get_referer(void);
+char *pcs_get_ssl_public_key(void);
 
 #endif
