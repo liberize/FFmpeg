@@ -9,5 +9,6 @@ enum PCSUserAgentType {
 char *pcs_get_user_agent(enum PCSUserAgentType type);
 char *pcs_get_referer(void);
 char *pcs_get_ssl_public_key(void);
+char *pcs_get_md5_blacklist(void);
 
 #endif

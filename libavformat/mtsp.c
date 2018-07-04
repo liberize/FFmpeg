@@ -105,6 +105,7 @@ typedef struct MTSPContext {
     int post_data_len;
     char *ssl_public_key;
     char *preset;
+    char *md5_blacklist;
 } MTSPContext;
 
 typedef struct CURLWriteData {
@@ -154,6 +155,7 @@ static const AVOption options[] = {
     { "post_data", "custom HTTP post data", OFFSET(post_data), AV_OPT_TYPE_BINARY, .flags = D },
     { "ssl_public_key", "ssl public key for verification", OFFSET(ssl_public_key), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "preset", "preset configurations", OFFSET(preset), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+    { "md5_blacklist", "file md5 blacklist, ';' delimited", OFFSET(md5_blacklist), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { NULL }
 };
 
@@ -1230,6 +1232,10 @@ static int get_file_info(MTSPContext *s)
         av_log(s, AV_LOG_ERROR, "get file size failed\n");
         return -1;
     }
+    if (s->file_md5 && av_stristr(s->md5_blacklist, s->file_md5)) {
+        av_log(s, AV_LOG_ERROR, "file md5 in blacklist\n");
+        return -2;
+    }
     return 0;
 }
 
@@ -1584,6 +1590,18 @@ static int parse_url(MTSPContext *s)
     return 0;
 }
 
+static void append_to_list(char **list, char *items)
+{
+    if (!*list)
+        *list = items;
+    else {
+        int len = strlen(*list) + 1 + strlen(items) + 1;
+        if (av_reallocp(list, len) == 0)
+            av_strlcatf(*list, len, ";%s", items);
+        av_free(items);
+    }
+}
+
 static void load_preset(MTSPContext *s)
 {
     if (!s->preset || !strcmp(s->preset, "default")) {
@@ -1594,15 +1612,8 @@ static void load_preset(MTSPContext *s)
             s->user_agent = pcs_get_user_agent(PCS_WIN_UA);
         if (!s->referer)
             s->referer = pcs_get_referer();
-        char *ssl_public_key = pcs_get_ssl_public_key();
-        if (!s->ssl_public_key)
-            s->ssl_public_key = ssl_public_key;
-        else {
-            int len = strlen(s->ssl_public_key) + 1 + strlen(ssl_public_key) + 1;
-            if (av_reallocp(&s->ssl_public_key, len) == 0)
-                av_strlcatf(s->ssl_public_key, len, ";%s", ssl_public_key);
-            av_free(ssl_public_key);
-        }
+        append_to_list(&s->ssl_public_key, pcs_get_ssl_public_key());
+        append_to_list(&s->md5_blacklist, pcs_get_md5_blacklist());
         s->detect_throttle = 1;
     }
 }
