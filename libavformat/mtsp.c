@@ -33,9 +33,9 @@ struct Worker;
 
 typedef struct Chunk {
     uint8_t *buffer;
-    int size;
-    int read_pos;
-    int end_pos;
+    int64_t size;
+    int64_t read_pos;
+    int64_t end_pos;
     int64_t start;
     struct Worker *worker;
     struct Chunk *prev;
@@ -139,9 +139,9 @@ const char MTSP_RC4_KEY[16] = { 0xbf, 0xa8, 0xf0, 0x70, 0x1e, 0xc7, 0xdc, 0x86, 
 static const AVOption options[] = {
     { "file_dir", "output directory path", OFFSET(file_dir), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "reconnect_interval", "reconnect interval in seconds", OFFSET(reconnect_interval), AV_OPT_TYPE_INT, { .i64 = 3 }, 0, 60, D },
-    { "update_speed_interval", "calculate speed interval in seconds", OFFSET(update_speed_interval), AV_OPT_TYPE_INT, { .i64 = 2 }, 0, 60, D },
+    { "update_speed_interval", "calculate speed interval in seconds", OFFSET(update_speed_interval), AV_OPT_TYPE_INT, { .i64 = 5 }, 0, 60, D },
     { "dont_write_disk", "buffering data in memory only", OFFSET(dont_write_disk), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
-    { "disk_cache", "disk cache size in bytes", OFFSET(disk_cache), AV_OPT_TYPE_INT, { .i64 = 4 * 1024 * 1024 }, 0, 64 * 1024 * 1024, D },
+    { "disk_cache", "disk cache size in bytes", OFFSET(disk_cache), AV_OPT_TYPE_INT, { .i64 = 1 * 1024 * 1024 }, 0, 64 * 1024 * 1024, D },
     { "max_conn", "max simultaneous connections to server", OFFSET(max_conn), AV_OPT_TYPE_INT, { .i64 = 64 }, 0, 1024, D },
     { "bitrate", "bit rate of stream", OFFSET(bitrate), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, D },
     { "throttled_speed", "speed limit by server", OFFSET(throttled_speed), AV_OPT_TYPE_INT, { .i64 = 0 }, -1, INT_MAX, D },
@@ -162,9 +162,10 @@ static const AVOption options[] = {
 
 static int init_curl_handle(MTSPContext *s, Worker *worker);
 static void destroy_curl_handle(MTSPContext *s, Worker *worker);
+static int is_download_complete(MTSPContext *s);
 
 
-static Chunk *insert_new_chunk(MTSPContext *s, Chunk *chunk, int64_t start, int size, Worker *worker)
+static Chunk *insert_new_chunk(MTSPContext *s, Chunk *chunk, int64_t start, int64_t size, Worker *worker)
 {
     av_log(s, AV_LOG_DEBUG, "insert_new_chunk <%"PRId64"-%"PRId64">\n", start, start + size);
     Chunk *new_chunk = av_malloc(sizeof(Chunk));
@@ -181,7 +182,7 @@ static Chunk *insert_new_chunk(MTSPContext *s, Chunk *chunk, int64_t start, int 
     } else {
         new_chunk->buffer = av_malloc(size);
         if (!new_chunk->buffer) {
-            av_log(s, AV_LOG_ERROR, "failed to alloc buffer for new chunk, size: %d\n", size);
+            av_log(s, AV_LOG_ERROR, "failed to alloc buffer for new chunk, size: %lld\n", size);
             av_free(new_chunk);
             return NULL;
         }
@@ -240,7 +241,7 @@ static int merge_next_chunk(MTSPContext *s, Chunk *chunk)
 
     av_log(s, AV_LOG_DEBUG, "merge_next_chunk <%"PRId64"-%"PRId64"> and <%"PRId64"-%"PRId64">\n",
         chunk->start, chunk->start + chunk->size, next->start, next->start + next->size);
-    int new_size = chunk->size + next->size;
+    int64_t new_size = chunk->size + next->size;
     if (chunk->buffer) {
         uint8_t *new_buffer = av_realloc(chunk->buffer, new_size);
         if (!new_buffer)
@@ -330,8 +331,11 @@ static int open_local_file(MTSPContext *s, int *exists)
             return AVERROR(EIO);
         }
         int ret = allocate_file(s->fp, 0, s->file_size, 0);
-        if (ret < 0)
-            return ret;
+        if (ret < 0) {
+            ret = truncate_file(s->fp, s->file_size);
+            if (ret < 0)
+                return ret;
+        }
     }
     return 0;
 }
@@ -357,7 +361,7 @@ static int open_progress_file(MTSPContext *s, const char *mode)
     if (!s->progress_file_name) {
         if (!s->file_name)
             return -4;
-        s->progress_file_name = av_asprintf("%s.dat", s->file_name);
+        s->progress_file_name = av_asprintf("%s.tmp", s->file_name);
         av_log(s, AV_LOG_INFO, "file name: %s, progress file name: %s\n", s->file_name, s->progress_file_name);
     }
 
@@ -379,6 +383,21 @@ static void close_progress_file(MTSPContext *s)
         fclose(s->progress_fp);
         s->progress_fp = NULL;
     }
+}
+
+static int remove_progress_file(MTSPContext *s)
+{
+    if (check_output_dir(s) < 0)
+        return -1;
+    if (!s->progress_file_name)
+        return -2;
+
+    av_log(s, AV_LOG_DEBUG, "remove_progress_file\n");
+    char *file_path = av_asprintf("%s/%s", s->file_dir, s->progress_file_name);
+    int ret = remove_file(file_path);
+    if (ret < 0)
+        return ret;
+    return 0;
 }
 
 static int save_progress(MTSPContext *s)
@@ -835,6 +854,8 @@ static void flush_chunk_pool(MTSPContext *s)
         chunk = chunk->next;
     }
     save_progress_to_file(s);
+    if (is_download_complete(s))
+        remove_progress_file(s);
 }
 
 static void destroy_chunk_pool(MTSPContext *s)
@@ -928,17 +949,17 @@ static void check_buffer_len(MTSPContext *s)
     s->buffer_not_enough = 0;
 }
 
-static int put_data_to_pool(MTSPContext *s, Worker *worker, const uint8_t *data, int len)
+static size_t put_data_to_pool(MTSPContext *s, Worker *worker, const uint8_t *data, size_t len)
 {
     if (!worker->current_chunk)
         return 0;
 
     Chunk *chunk = worker->current_chunk;
-    int remain = len;
+    int64_t remain = len;
     while (remain) {
-        int avail = chunk->size - chunk->end_pos;
+        int64_t avail = chunk->size - chunk->end_pos;
         if (avail) {
-            int copied = FFMIN(remain, avail);
+            int64_t copied = FFMIN(remain, avail);
             memcpy(chunk->buffer + chunk->end_pos, data, copied);
             chunk->end_pos += copied;
             data += copied;
@@ -954,25 +975,27 @@ static int put_data_to_pool(MTSPContext *s, Worker *worker, const uint8_t *data,
         }
     }
     if (worker->current_chunk)
-        av_log(s, AV_LOG_DEBUG, "put_data_to_pool, worker <%"PRId64"-%"PRId64">, len: %d, end pos: %"PRId64"\n",
+        av_log(s, AV_LOG_DEBUG, "put_data_to_pool, worker <%"PRId64"-%"PRId64">, len: %lu, end pos: %"PRId64"\n",
             worker->start, worker->end, len, worker->current_chunk->start + worker->current_chunk->end_pos);
     return len - remain;
 }
 
-static int get_data_from_pool(MTSPContext *s, uint8_t *data, int len)
+static size_t get_data_from_pool(MTSPContext *s, uint8_t *data, size_t len)
 {
-    av_log(s, AV_LOG_DEBUG, "get_data_from_pool, len: %d, read pos: %"PRId64", current chunk: %p\n",
+    av_log(s, AV_LOG_DEBUG, "get_data_from_pool, len: %lu, read pos: %"PRId64", current chunk: %p\n",
             len, s->read_pos, s->current_read_chunk);
+    if (s->read_pos >= s->file_size)
+        return AVERROR_EOF;
     if (!s->current_read_chunk) {
         on_buffer_empty(s);
         return 0;
     }
     Chunk *chunk = s->current_read_chunk;
-    int remain = len;
+    int64_t remain = len;
     while (remain) {
-        int avail = chunk->end_pos - chunk->read_pos;
+        int64_t avail = chunk->end_pos - chunk->read_pos;
         if (avail) {
-            int copied = FFMIN(avail, remain);
+            int64_t copied = FFMIN(avail, remain);
             if (chunk->buffer) {
                 memcpy(data, chunk->buffer + chunk->read_pos, copied);
             } else {
@@ -1051,7 +1074,7 @@ static size_t write_func(void *contents, size_t size, size_t nmemb, void *userp)
     }
 
     pthread_mutex_lock(&s->mutex_data);
-    int ret = put_data_to_pool(s, data->worker, contents, l);
+    size_t ret = put_data_to_pool(s, data->worker, contents, l);
     pthread_mutex_unlock(&s->mutex_data);
     return ret;
 }
@@ -1232,7 +1255,7 @@ static int get_file_info(MTSPContext *s)
         av_log(s, AV_LOG_ERROR, "get file size failed\n");
         return -1;
     }
-    if (s->file_md5 && av_stristr(s->md5_blacklist, s->file_md5)) {
+    if (s->file_md5 && s->md5_blacklist && av_stristr(s->md5_blacklist, s->file_md5)) {
         av_log(s, AV_LOG_ERROR, "file md5 in blacklist\n");
         return -2;
     }
@@ -1523,7 +1546,7 @@ fail:
     pthread_mutex_lock(&s->mutex_data);
     destroy_worker_pool(s);
     flush_chunk_pool(s);
-    check_md5(s);
+    // check_md5(s);
     destroy_chunk_pool(s);
     close_local_file(s);
     pthread_mutex_unlock(&s->mutex_data);
@@ -1549,45 +1572,72 @@ fail:
 
 static int parse_url(MTSPContext *s)
 {
-    const char *p;
+    char *url = av_strdup(s->url);
+    char *p;
     char proto[10];
     char real_url[MAX_URL_SIZE];
+    int ret = 0;
 
-    if ((p = strchr(s->url, ':'))) {
-        av_strlcpy(proto, s->url, FFMIN(sizeof(proto), p + 1 - s->url));
+    if ((p = strchr(url, ':'))) {
+        av_strlcpy(proto, url, FFMIN(sizeof(proto), p + 1 - url));
         if (!strcmp(proto, "http") || !strcmp(proto, "https"))
-            return 0;
+            goto exit;
         p++; /* skip ':' */
         if (*p == '/')
             p++;
         if (*p == '/')
             p++;
     } else {
-        p = s->url;
+        p = url;
     }
 
-    int ret = av_base64_decode(real_url, p, MAX_URL_SIZE);
-    if (ret < 0)
-        return AVERROR(EINVAL);
+    char *q = strchr(p, '?');
+    if (q) {
+        *q++ = 0;
+        char *param, *next_param = q;
+        while ((param = av_strtok(next_param, "&", &next_param))) {
+            char *name, *value;
+            if ((name = av_strtok(param, "=", &value))) {
+                char *decoded_value = ff_urldecode(value);
+                av_log(s, AV_LOG_INFO, "set option from url, -%s \"%s\"\n", name, decoded_value);
+                int ret = av_opt_set(s, name, decoded_value, 0);
+                if (ret < 0)
+                    av_log(s, AV_LOG_WARNING, "failed to set option from url params, err: %d\n", ret);
+                av_free(decoded_value);
+            }
+        }
+    }
+
+    ret = av_base64_decode(real_url, p, MAX_URL_SIZE);
+    if (ret < 0) {
+        ret = AVERROR(EINVAL);
+        goto exit;
+    }
 
     if (!av_strstart(real_url, "http://", NULL) &&
         !av_strstart(real_url, "https://", NULL)) {
 
         struct AVRC4 *rc4 = av_rc4_alloc();
-        if (!rc4)
-            return AVERROR(ENOMEM);
+        if (!rc4) {
+            ret = AVERROR(ENOMEM);
+            goto exit;
+        }
         av_rc4_init(rc4, MTSP_RC4_KEY, 128, 1);
         av_rc4_crypt(rc4, real_url, real_url, ret, NULL, 1);
         av_free(rc4);
 
         if (!av_strstart(real_url, "http://", NULL) &&
-            !av_strstart(real_url, "https://", NULL))
-            return AVERROR(EINVAL);
+            !av_strstart(real_url, "https://", NULL)) {
+            ret = AVERROR(EINVAL);
+            goto exit;
+        }
     }
     
     av_strlcpy(s->url, real_url, ret + 1);
     av_log(s, AV_LOG_INFO, "parse_url, real url: %s\n", s->url);
-    return 0;
+exit:
+    av_free(url);
+    return ret;
 }
 
 static void append_to_list(char **list, char *items)
@@ -1612,7 +1662,8 @@ static void load_preset(MTSPContext *s)
             s->user_agent = pcs_get_user_agent(PCS_WIN_UA);
         if (!s->referer)
             s->referer = pcs_get_referer();
-        append_to_list(&s->ssl_public_key, pcs_get_ssl_public_key());
+        // set ssl_public_key to prevent packet capturing
+        // append_to_list(&s->ssl_public_key, pcs_get_ssl_public_key());
         append_to_list(&s->md5_blacklist, pcs_get_md5_blacklist());
         s->detect_throttle = 1;
     }
@@ -1626,7 +1677,6 @@ static int mtsp_open(URLContext *h, const char *uri, int flags,
 
     av_log(h, AV_LOG_INFO, "mtsp_open, uri: %s\n", uri);
     MTSPContext *s = h->priv_data;
-    load_preset(s);
 
     s->url = av_strdup(uri);
     if (!s->url)
@@ -1635,6 +1685,8 @@ static int mtsp_open(URLContext *h, const char *uri, int flags,
     int ret = parse_url(s);
     if (ret < 0)
         goto fail;
+
+    load_preset(s);
 
     ret = pthread_mutex_init(&s->mutex_init, NULL);
     if (ret) {

@@ -12,5 +12,6 @@ int is_writable(const char *path);
 char *current_directory(void);
 size_t file_size(FILE *fp);
 char *conv_file_name(char *utf8_name);
+int remove_file(const char *path);
 
 #endif

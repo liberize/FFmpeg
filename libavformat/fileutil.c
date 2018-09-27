@@ -225,3 +225,17 @@ char *conv_file_name(char *utf8_name)
     return av_strdup(utf8_name);
 #endif
 }
+
+int remove_file(const char *path)
+{
+#if defined(_WIN32)
+    int err = _unlink(path);
+#else 
+    int err = unlink(path);
+#endif
+    if (err != 0 && errno != ENOENT) {
+        av_log(NULL, AV_LOG_ERROR, "remove file failed. errno: %d\n", errno);
+        return AVERROR(errno);
+    }
+    return 0;
+}
