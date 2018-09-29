@@ -93,7 +93,6 @@ typedef struct MTSPContext {
     int max_conn;
     int bitrate;            // 0: unknown, other: bitrate
     int throttled_speed;    // 0: unknown, -1: no throttle, other: throttled speed
-    int detect_throttle;
     int min_range_len;
     int max_range_len;
     int last_range_len;
@@ -129,7 +128,6 @@ typedef struct ByteRange {
 #define DEFAULT_USER_AGENT "Lavf/" AV_STRINGIFY(LIBAVFORMAT_VERSION)
 #define WHITESPACES " \n\t\r"
 #define MAX_RANGES 4096
-#define THROTTLE_THRESHOLD (100 * 1024)
 #define MD5_BLOCK_SIZE (1024 * 1024)
 #define BUFFER_ENOUGH_THRESHOLD (2 * 1024 * 1024)
 
@@ -142,10 +140,9 @@ static const AVOption options[] = {
     { "update_speed_interval", "calculate speed interval in seconds", OFFSET(update_speed_interval), AV_OPT_TYPE_INT, { .i64 = 5 }, 0, 60, D },
     { "dont_write_disk", "buffering data in memory only", OFFSET(dont_write_disk), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
     { "disk_cache", "disk cache size in bytes", OFFSET(disk_cache), AV_OPT_TYPE_INT, { .i64 = 1 * 1024 * 1024 }, 0, 64 * 1024 * 1024, D },
-    { "max_conn", "max simultaneous connections to server", OFFSET(max_conn), AV_OPT_TYPE_INT, { .i64 = 64 }, 0, 1024, D },
+    { "max_conn", "max simultaneous connections to server", OFFSET(max_conn), AV_OPT_TYPE_INT, { .i64 = 64 }, 1, 2048, D },
     { "bitrate", "bit rate of stream", OFFSET(bitrate), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, D },
     { "throttled_speed", "speed limit by server", OFFSET(throttled_speed), AV_OPT_TYPE_INT, { .i64 = 0 }, -1, INT_MAX, D },
-    { "detect_throttle", "detect speed throttle", OFFSET(detect_throttle), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
     { "min_range_len", "min download range in bytes", OFFSET(min_range_len), AV_OPT_TYPE_INT, { .i64 = 100 * 1024 }, 0, INT_MAX, D },
     { "max_range_len", "max download range in bytes", OFFSET(max_range_len), AV_OPT_TYPE_INT, { .i64 = 2 * 1024 * 1024 }, 0, INT_MAX, D },
     { "user_agent", "User-Agent header", OFFSET(user_agent), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
@@ -620,9 +617,7 @@ static void reset_worker_end(MTSPContext *s, Worker *worker, int64_t end)
 
 static int pick_next_range(MTSPContext *s, int64_t *start, int64_t *end)
 {
-    int max_conn = (!s->detect_throttle || s->throttled_speed) ? s->max_conn : 3;
-    if (s->buffer_not_enough && s->throttled_speed > 0)
-        max_conn += FFMIN(max_conn / 4, 10);
+    int max_conn = s->max_conn;
     if (s->seek_end_for_meta)
         max_conn += 1;
     if (s->running_workers >= max_conn)
@@ -687,9 +682,7 @@ static int pick_next_range(MTSPContext *s, int64_t *start, int64_t *end)
     }
 
     if (s->throttled_speed == -1)
-        *end = end_pos;
-    else if (s->throttled_speed == 0)
-        *end = FFMIN(*start + s->min_range_len, end_pos);
+        *end = FFMIN(*start + s->max_range_len, end_pos);
     else {
         int len = s->min_range_len;
         if (s->seek_end_for_meta) {
@@ -787,24 +780,9 @@ static void on_worker_done(MTSPContext *s, Worker *worker)
     res = res || curl_easy_getinfo(worker->curl_handle, CURLINFO_SIZE_DOWNLOAD_T, &size);
     if (res)
         av_log(s, AV_LOG_WARNING, "failed to get average speed\n");
-    else if (size >= s->min_range_len) {
+    else if (size >= s->min_range_len)
         s->worker_avg_speed = (s->worker_avg_speed * (s->finished_workers - 1) + speed) / s->finished_workers;
-        if (s->detect_throttle && !s->throttled_speed && speed >= THROTTLE_THRESHOLD) {
-            s->throttled_speed = -1;
-            s->max_conn = 1;    // fallback to single connection
-            s->min_range_len = 500 * 1024;
-        }
-        if (s->detect_throttle && s->throttled_speed != -1 && s->finished_workers >= 3)
-            if (s->worker_avg_speed < 15 * 1024) {
-                s->throttled_speed = 10 * 1024;
-                s->max_conn = 64;
-                s->min_range_len = 100 * 1024;
-            } else {
-                s->throttled_speed = s->worker_avg_speed;
-                s->max_conn = 16;
-                s->min_range_len = FFMIN(s->worker_avg_speed * 10, 500 * 1024);
-            }
-    }
+
     av_log(s, AV_LOG_DEBUG, "on_worker_done <%"PRId64"-%"PRId64">, speed: %.1fkB/s, finished workers: %d, avg speed: %.1fkB/s\n",
         worker->start, worker->end, speed / 1024.0, s->finished_workers, s->worker_avg_speed / 1024.0);
     destroy_worker(s, worker);
@@ -935,7 +913,7 @@ static void check_buffer_len(MTSPContext *s)
     }
 
     int64_t remain = chunk->size - chunk->end_pos;
-    if (remain > 0 && s->bitrate) {
+    if (remain > 0 && s->bitrate && s->throttled_speed > 0) {
         int64_t len = s->throttled_speed * buffered_data / (s->bitrate / 8 - s->throttled_speed);
         if (len < remain) {
             on_buffer_not_enough(s);
@@ -1284,23 +1262,11 @@ static void calc_speed(MTSPContext *s, double interval, int print)
                         worker->start, worker->end, temp_speed / 1024.0, avg_speed / 1024.0, time_spent,
                         worker->current_chunk ? worker->current_chunk->start + worker->current_chunk->end_pos : worker->end);
             worker->downloaded_size = size;
-            if (time_spent >= 5.0 && s->detect_throttle && !s->throttled_speed)
-                if (avg_speed >= THROTTLE_THRESHOLD) {
-                    s->throttled_speed = -1;
-                    s->max_conn = 1;
-                    s->min_range_len = 500 * 1024;
-                } else if (avg_speed < 15 * 1024)
-                    low_speed_worker++;
         }
         total_worker++;
         if (!worker->next_reconnect)
             active_worker++;
         worker = worker->prev;
-    }
-    if (s->detect_throttle && !s->throttled_speed && low_speed_worker == total_worker && total_worker >= 3) {
-        s->throttled_speed = 10 * 1024;
-        s->max_conn = 64;
-        s->min_range_len = 100 * 1024;
     }
     int64_t total_size = 0;
     Chunk *chunk = s->chunk_pool;
@@ -1665,7 +1631,6 @@ static void load_preset(MTSPContext *s)
         // set ssl_public_key to prevent packet capturing
         // append_to_list(&s->ssl_public_key, pcs_get_ssl_public_key());
         append_to_list(&s->md5_blacklist, pcs_get_md5_blacklist());
-        s->detect_throttle = 1;
     }
 }
 
