@@ -105,6 +105,9 @@ typedef struct MTSPContext {
     char *ssl_public_key;
     char *preset;
     char *md5_blacklist;
+    char *message_types;
+    int message_output_port;
+    URLContext *message_output;
 } MTSPContext;
 
 typedef struct CURLWriteData {
@@ -143,7 +146,7 @@ static const AVOption options[] = {
     { "max_conn", "max simultaneous connections to server", OFFSET(max_conn), AV_OPT_TYPE_INT, { .i64 = 64 }, 1, 2048, D },
     { "bitrate", "bit rate of stream", OFFSET(bitrate), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, D },
     { "throttled_speed", "speed limit by server", OFFSET(throttled_speed), AV_OPT_TYPE_INT, { .i64 = 0 }, -1, INT_MAX, D },
-    { "min_range_len", "min download range in bytes", OFFSET(min_range_len), AV_OPT_TYPE_INT, { .i64 = 100 * 1024 }, 0, INT_MAX, D },
+    { "min_range_len", "min download range in bytes", OFFSET(min_range_len), AV_OPT_TYPE_INT, { .i64 = 200 * 1024 }, 0, INT_MAX, D },
     { "max_range_len", "max download range in bytes", OFFSET(max_range_len), AV_OPT_TYPE_INT, { .i64 = 2 * 1024 * 1024 }, 0, INT_MAX, D },
     { "user_agent", "User-Agent header", OFFSET(user_agent), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "referer", "Referer header", OFFSET(referer), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
@@ -153,6 +156,8 @@ static const AVOption options[] = {
     { "ssl_public_key", "ssl public key for verification", OFFSET(ssl_public_key), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "preset", "preset configurations", OFFSET(preset), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "md5_blacklist", "file md5 blacklist, ';' delimited", OFFSET(md5_blacklist), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+    { "message_types", "message types of interest, ';' delimited", OFFSET(message_types), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+    { "message_output_port", "local udp port to write messages to", OFFSET(message_output_port), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 65535, D },
     { NULL }
 };
 
@@ -397,13 +402,8 @@ static int remove_progress_file(MTSPContext *s)
     return 0;
 }
 
-static int save_progress(MTSPContext *s)
+static int get_byte_ranges(MTSPContext *s, ByteRange *ranges, int n)
 {
-    av_log(s, AV_LOG_DEBUG, "save_progress\n");
-    if (!s->progress_fp)
-        return -1;
-
-    ByteRange *ranges = malloc(MAX_RANGES * sizeof(ByteRange));
     int i = -1;
     Chunk *chunk = s->chunk_pool;
     while (chunk) {
@@ -412,7 +412,7 @@ static int save_progress(MTSPContext *s)
                 i = 0;
                 ranges[i].start = chunk->start;
             } else if (ranges[i].end != chunk->start) {
-                if (i + 1 >= MAX_RANGES) {
+                if (i + 1 >= n) {
                     av_log(s, AV_LOG_ERROR, "too many ranges\n");
                     break;
                 }
@@ -422,15 +422,28 @@ static int save_progress(MTSPContext *s)
         }
         chunk = chunk->next;
     }
-    if (i != -1) {
+    return i + 1;
+}
+
+static int save_progress(MTSPContext *s)
+{
+    av_log(s, AV_LOG_DEBUG, "save_progress\n");
+    if (!s->progress_fp)
+        return -1;
+
+    int ret = 0;
+    ByteRange *ranges = av_malloc(MAX_RANGES * sizeof(ByteRange));
+    int n = get_byte_ranges(s, ranges, MAX_RANGES);
+    if (n > 0) {
         fseek(s->progress_fp, 0, SEEK_SET);
-        int nwritten = fwrite(ranges, sizeof(ByteRange), i + 1, s->progress_fp);
-        if (nwritten != i + 1) {
+        int nwritten = fwrite(ranges, sizeof(ByteRange), n, s->progress_fp);
+        if (nwritten != n) {
             av_log(s, AV_LOG_ERROR, "failed to write progress\n");
-            return AVERROR(EIO);
+            ret = AVERROR(EIO);
         }
     }
-    return 0;
+    av_free(ranges);
+    return ret;
 }
 
 static void save_progress_to_file(MTSPContext *s)
@@ -456,19 +469,22 @@ static int load_progress(MTSPContext *s)
         return -3;
     }
     
-    ByteRange *ranges = malloc(size);
+    int ret = 0;
+    ByteRange *ranges = av_malloc(size);
     int count = size / sizeof(ByteRange);
     int nread = fread(ranges, sizeof(ByteRange), count, s->progress_fp);
     if (nread != count) {
         av_log(s, AV_LOG_ERROR, "failed to read progress\n");
-        return AVERROR(EIO);
+        ret = AVERROR(EIO);
+        goto fail;
     }
 
     for (int i = 0; i < count; i++) {
         if (ranges[i].start < 0 || ranges[i].start >= ranges[i].end ||
             (i && ranges[i].start < ranges[i-1].end)) {
             av_log(s, AV_LOG_ERROR, "invalid progress file, start: %"PRId64", end: %"PRId64"\n", ranges[i].start, ranges[i].end);
-            return -4;
+            ret = -4;
+            goto fail;
         }
     }
 
@@ -483,7 +499,10 @@ static int load_progress(MTSPContext *s)
 
     if (!s->current_read_chunk && s->chunk_pool && s->chunk_pool->start == 0)
         s->current_read_chunk = s->chunk_pool;
-    return 0;
+
+fail:
+    av_free(ranges);
+    return ret;
 }
 
 static void load_progress_from_file(MTSPContext *s)
@@ -1242,7 +1261,7 @@ static int get_file_info(MTSPContext *s)
 
 static void calc_speed(MTSPContext *s, double interval, int print)
 {
-    int total_worker = 0, low_speed_worker = 0, active_worker = 0;
+    int total_worker = 0, active_worker = 0;
     Worker *worker = s->worker_pool;
     while (worker) {
         double total_time, start_time;
@@ -1359,6 +1378,55 @@ static void merge_chunk_pool(MTSPContext *s)
     }
 }
 
+static int send_message(MTSPContext *s, const char *type, const char *data)
+{
+    if (!s->message_types || !s->message_output_port)
+        return -1;
+
+    int len = 0;
+    if (!type || !(len = strlen(type)))
+        return -2;
+    const char *start = strstr(s->message_types, type);
+    if (!start || (start != s->message_types && start[-1] != ';') ||
+        (start[len] != '\0' && start[len] != ';'))
+        return -2;
+
+    if (!s->message_output) {
+        char *url = av_asprintf("udp://127.0.0.1:%d", s->message_output_port);
+        int ret = ffurl_open(&s->message_output, url, AVIO_FLAG_WRITE, NULL, NULL);
+        av_free(url);
+        if (ret < 0)
+            return ret;
+    }
+
+    char *buf = av_asprintf("{\"type\":\"%s\",\"data\":%s}", type, data);
+    int nwritten = ffurl_write(s->message_output, buf, strlen(buf));
+    av_free(buf);
+
+    return nwritten;
+}
+
+static int send_buffer_ranges(MTSPContext *s)
+{
+    int ret = 0;
+    ByteRange *ranges = av_malloc(MAX_RANGES * sizeof(ByteRange));
+    int n = get_byte_ranges(s, ranges, MAX_RANGES);
+    if (n > 0) {
+        const int max_len = n * 60;
+        char *buf = av_malloc(max_len);
+        buf[0] = '[';
+        buf[1] = '\0';
+        int len = 1;
+        for (int i = 0; i < n; i++)
+            len += av_strlcatf(buf + len, max_len, "{\"from\":%"PRId64",\"to\":%"PRId64"},", ranges[i].start, ranges[i].end);
+        buf[len - 1] = ']';
+        ret = send_message(s, "buffer-ranges", buf);
+        av_free(buf);
+    }
+    av_free(ranges);
+    return ret;
+}
+
 static void *download_task(void *arg)
 {
     MTSPContext *s = arg;
@@ -1372,6 +1440,7 @@ static void *download_task(void *arg)
     int64_t start, end;
     int64_t last_update_speed = 0;
     int64_t last_merge_chunk = 0;
+    int64_t last_send_buffer_ranges = 0;
 
     curl_global_init(CURL_GLOBAL_ALL);
 
@@ -1391,7 +1460,7 @@ static void *download_task(void *arg)
     }
 
     s->curl_multi_handle = curl_multi_init();
-    // curl_multi_setopt(s->curl_multi_handle, CURLMOPT_MAXCONNECTS, (long)s->max_conn);
+    curl_multi_setopt(s->curl_multi_handle, CURLMOPT_MAXCONNECTS, (long)(s->max_conn + 1));
 
     pthread_mutex_lock(&s->mutex_init);
     s->exit_code = 0;
@@ -1499,6 +1568,16 @@ next:
             calc_speed(s, (now - last_update_speed) / 1000000.0, 1);
             pthread_mutex_unlock(&s->mutex_data);
             last_update_speed = now;
+        }
+
+        interval = 1 * 1000000;
+        if (!last_send_buffer_ranges)
+            last_send_buffer_ranges = now;
+        else if (now >= last_send_buffer_ranges + interval) {
+            pthread_mutex_lock(&s->mutex_data);
+            send_buffer_ranges(s);
+            pthread_mutex_unlock(&s->mutex_data);
+            last_send_buffer_ranges = now;
         }
 
         pthread_mutex_lock(&s->mutex_data);
@@ -1722,6 +1801,9 @@ static int mtsp_close(URLContext *h)
     pthread_mutex_destroy(&s->mutex_data);
     pthread_cond_destroy(&s->cond_init_done);
     pthread_mutex_destroy(&s->mutex_init);
+
+    if (s->message_output)
+        ffurl_closep(&s->message_output);
     av_freep(&s->url);
     return ret ? ret : s->exit_code;
 }
