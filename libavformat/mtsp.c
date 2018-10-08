@@ -272,18 +272,18 @@ static int check_output_dir(MTSPContext *s)
 {
     av_log(s, AV_LOG_DEBUG, "check_output_dir\n");
     if (s->file_dir) {
-        create_directory(s->file_dir);
-        if (!is_writable(s->file_dir)) {
+        av_create_directory(s->file_dir);
+        if (!av_is_writable(s->file_dir)) {
             return AVERROR(EIO);
         }
     } else {
-        char *dir = current_directory();
-        if (dir && is_writable(dir))
+        char *dir = av_current_directory();
+        if (dir && av_is_writable(dir))
             s->file_dir = dir;
         else {
             av_free(dir);
-            dir = temp_directory_path();
-            if (dir && is_writable(dir))
+            dir = av_temp_directory_path();
+            if (dir && av_is_writable(dir))
                 s->file_dir = dir;
             else {
                 av_free(dir);
@@ -318,7 +318,7 @@ static int open_local_file(MTSPContext *s, int *exists)
     *exists = 0;
     s->fp = fopen(file_path, "r+b");
     if (s->fp) {
-        size_t size = file_size(s->fp);
+        size_t size = av_file_size(s->fp);
         if (size == s->file_size)
             *exists = 1;
         else {
@@ -332,9 +332,9 @@ static int open_local_file(MTSPContext *s, int *exists)
             av_log(s, AV_LOG_ERROR, "failed to open file: %s\n", file_path);
             return AVERROR(EIO);
         }
-        int ret = allocate_file(s->fp, 0, s->file_size, 0);
+        int ret = av_allocate_file(s->fp, 0, s->file_size, 0);
         if (ret < 0) {
-            ret = truncate_file(s->fp, s->file_size);
+            ret = av_truncate_file(s->fp, s->file_size);
             if (ret < 0)
                 return ret;
         }
@@ -396,7 +396,7 @@ static int remove_progress_file(MTSPContext *s)
 
     av_log(s, AV_LOG_DEBUG, "remove_progress_file\n");
     char *file_path = av_asprintf("%s/%s", s->file_dir, s->progress_file_name);
-    int ret = remove_file(file_path);
+    int ret = av_remove_file(file_path);
     if (ret < 0)
         return ret;
     return 0;
@@ -463,7 +463,7 @@ static int load_progress(MTSPContext *s)
     if (s->chunk_pool)
         return -2;
 
-    size_t size = file_size(s->progress_fp);
+    size_t size = av_file_size(s->progress_fp);
     if (size % sizeof(ByteRange)) {
         av_log(s, AV_LOG_ERROR, "progress file size error\n");
         return -3;
@@ -1202,7 +1202,7 @@ static size_t header_func(void *header, size_t size, size_t nmemb, void *userp)
                         value++[len-1] = '\0';
                     char *utf8_name = ff_urldecode(value);
                     av_free(s->file_name);
-                    s->file_name = conv_file_name(utf8_name);
+                    s->file_name = av_conv_file_name(utf8_name);
                     av_free(utf8_name);
                     av_log(s, AV_LOG_DEBUG, "file name: %s\n", s->file_name);
                     break;
@@ -1814,12 +1814,20 @@ static int wait_data_timeout(MTSPContext *s, int64_t timeout, AVIOInterruptCB *i
     while (1) {
         if (ff_check_interrupt(int_cb))
             return AVERROR_EXIT;
+#ifdef _WIN32
+        if (SleepConditionVariableSRW(&s->cond_data_avail, &s->mutex_data, POLLING_TIME, 0))
+            return 0;
+        int err = GetLastError();
+        if (err != ERROR_TIMEOUT)
+            return err;
+#else
         int64_t t = av_gettime() + POLLING_TIME * 1000;
         struct timespec ts = { .tv_sec  =  t / 1000000,
                                .tv_nsec = (t % 1000000) * 1000 };
         int ret = pthread_cond_timedwait(&s->cond_data_avail, &s->mutex_data, &ts);
         if (ret != ETIMEDOUT)
             return ret;
+#endif
         if (timeout > 0) {
             if (!wait_start)
                 wait_start = av_gettime_relative();

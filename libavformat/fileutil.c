@@ -37,7 +37,7 @@ static inline FD file_no(FILE *fp)
 #endif
 }
 
-static inline int last_error()
+static inline int last_error(void)
 {
 #ifdef _WIN32
     return GetLastError();
@@ -46,13 +46,19 @@ static inline int last_error()
 #endif
 }
 
-int truncate_file(FILE *fp, int64_t length)
+int av_truncate_file(FILE *fp, int64_t length)
 {
     FD fd = file_no(fp);
 #ifdef _WIN32
     // Since mingw32's ftruncate cannot handle over 2GB files, we use
     // SetEndOfFile instead.
-    seek(length);
+    LARGE_INTEGER fileLength;
+    fileLength.QuadPart = length;
+    if (SetFilePointerEx(fd, fileLength, 0, FILE_BEGIN) == 0) {
+        int err = last_error();
+        av_log(NULL, AV_LOG_ERROR, "File seek failed. errno: %d\n", err);
+        return AVERROR(err);
+    }
     if (SetEndOfFile(fd) == 0)
 #else
     if (ftruncate(fd, length) == -1)
@@ -65,36 +71,31 @@ int truncate_file(FILE *fp, int64_t length)
     return 0;
 }
 
-int allocate_file(FILE *fp, int64_t offset, int64_t length, int sparse)
+int av_allocate_file(FILE *fp, int64_t offset, int64_t length, int sparse)
 {
     FD fd = file_no(fp);
     if (sparse) {
 #ifdef _WIN32
         DWORD bytesReturned;
-        if (!DeviceIoControl(fd, FSCTL_SET_SPARSE, 0, 0, 0, 0, &bytesReturned, 0)) {
+        if (!DeviceIoControl(fd, FSCTL_SET_SPARSE, 0, 0, 0, 0, &bytesReturned, 0))
             av_log(NULL, AV_LOG_WARNING, "Making file sparse failed or pending: %d\n", last_error());
-        }
 #endif
-        int ret = truncate_file(fp, offset + length);
-        if (ret != 0) {
-            return ret;
-        }
-        return 0;
+        return av_truncate_file(fp, offset + length);
     }
 #ifdef _WIN32
-    int ret = truncate_file(fp, offset + length);
-    if (ret != 0) {
+    int ret = av_truncate_file(fp, offset + length);
+    if (ret != 0)
         return ret;
-    }
-    if (!SetFileValidData(fd, offset + length)) {
+
+    if (!SetFileValidData(fd, offset + length))
         av_log(NULL, AV_LOG_WARNING,
                 "File allocation (SetFileValidData) failed (errno: %d). File will be "
                 "allocated by filling zero, which blocks whole execution. Run "
                 "as an administrator or use a different file allocation method.\n",
                 last_error());
-    }
+
 #elif defined(__APPLE__) && defined(__MACH__)
-    int64_t toalloc = offset + length - file_size(fp);
+    int64_t toalloc = offset + length - av_file_size(fp);
     fstore_t fstore = { F_ALLOCATECONTIG | F_ALLOCATEALL, F_PEOFPOSMODE, 0, toalloc, 0 };
     if (fcntl(fd, F_PREALLOCATE, &fstore) == -1) {
         // Retry non-contig.
@@ -132,7 +133,7 @@ int allocate_file(FILE *fp, int64_t offset, int64_t length, int sparse)
     return 0;
 }
 
-char *temp_directory_path(void)
+char *av_temp_directory_path(void)
 {
     const char *val = NULL;
     (val = getenv("TMPDIR" )) ||
@@ -156,7 +157,7 @@ char *temp_directory_path(void)
 #endif
 }
 
-int create_directory(const char *path)
+int av_create_directory(const char *path)
 {
 #if defined(_WIN32)
     int err = _mkdir(path);
@@ -171,10 +172,10 @@ int create_directory(const char *path)
     return 0;
 }
 
-int is_writable(const char *path)
+int av_is_writable(const char *path)
 {
 #if defined(_WIN32)
-    int err = _access(path, 2)
+    int err = _access(path, 2);
 #else 
     int err = access(path, W_OK);
 #endif
@@ -183,7 +184,7 @@ int is_writable(const char *path)
     return 1;
 }
 
-char *current_directory(void)
+char *av_current_directory(void)
 {
 #if defined(_WIN32)
     char buf[MAX_PATH];
@@ -199,7 +200,7 @@ char *current_directory(void)
     return av_strdup(cwd);
 }
 
-size_t file_size(FILE *fp)
+size_t av_file_size(FILE *fp)
 {
     size_t prev = ftell(fp);
     fseek(fp, 0L, SEEK_END);
@@ -208,16 +209,16 @@ size_t file_size(FILE *fp)
     return size;
 }
 
-char *conv_file_name(char *utf8_name)
+char *av_conv_file_name(char *utf8_name)
 {
 #if defined(_WIN32)
-    int len = ::MultiByteToWideChar(CP_UTF8, 0, utf8_name, -1, NULL, 0);
+    int len = MultiByteToWideChar(CP_UTF8, 0, utf8_name, -1, NULL, 0);
     wchar_t *unicode = av_mallocz((len + 1) * sizeof(wchar_t));
-    ::MultiByteToWideChar(CP_UTF8, 0, utf8_name, -1, unicode, len);
+    MultiByteToWideChar(CP_UTF8, 0, utf8_name, -1, unicode, len);
 
-    len = ::WideCharToMultiByte(CP_ACP, 0, unicode, -1, NULL, 0, NULL, NULL);
+    len = WideCharToMultiByte(CP_ACP, 0, unicode, -1, NULL, 0, NULL, NULL);
     char *ansi_name = av_mallocz((len + 1) * sizeof(char));
-    ::WideCharToMultiByte(CP_ACP, 0, unicode, -1, ansi_name, len, NULL, NULL);  
+    WideCharToMultiByte(CP_ACP, 0, unicode, -1, ansi_name, len, NULL, NULL);  
   
     av_free(unicode);
     return ansi_name;
@@ -226,7 +227,7 @@ char *conv_file_name(char *utf8_name)
 #endif
 }
 
-int remove_file(const char *path)
+int av_remove_file(const char *path)
 {
 #if defined(_WIN32)
     int err = _unlink(path);
